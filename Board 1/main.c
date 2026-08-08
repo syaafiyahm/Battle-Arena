@@ -273,21 +273,28 @@ static void RefreshStatusLine(void)
 
 /*=============================================================================
     Sprite helpers
+
+    NOTE: sprite bitmaps are declared `const` in Sprites.c/h so the linker
+    keeps them in flash instead of copying 14KB of image data into this
+    chip's 16KB of RAM at startup. LCD.h's draw_Bmp32x48()/draw_LCD() take
+    plain (non-const) unsigned char*, so we cast away const right here, in
+    one place, when handing bitmaps to the vendor library - the library
+    only reads these buffers, never writes them, so this is safe.
 =============================================================================*/
-static void DrawSprite(int16_t x, unsigned char *bmp)
+static void DrawSprite(int16_t x, const unsigned char *bmp)
 {
-    draw_Bmp32x48(x, SPRITE_Y, FG_COLOR, BG_COLOR, bmp);
+    draw_Bmp32x48(x, SPRITE_Y, FG_COLOR, BG_COLOR, (unsigned char *)bmp);
 }
 
-static void EraseSprite(int16_t x, unsigned char *bmp)
+static void EraseSprite(int16_t x, const unsigned char *bmp)
 {
-    draw_Bmp32x48(x, SPRITE_Y, BG_COLOR, BG_COLOR, bmp);
+    draw_Bmp32x48(x, SPRITE_Y, BG_COLOR, BG_COLOR, (unsigned char *)bmp);
 }
 
 /* Brief "got hit" animation: swap to the defeat bitmap for a moment, then
    back to normal. Used both when I get hit and (visually) when I land a
    confirmed hit on the enemy. */
-static void FlashDefeat(int16_t x, unsigned char *normalBmp, unsigned char *defeatBmp)
+static void FlashDefeat(int16_t x, const unsigned char *normalBmp, const unsigned char *defeatBmp)
 {
     EraseSprite(x, normalBmp);
     DrawSprite(x, defeatBmp);
@@ -419,8 +426,10 @@ static void ResetMatch(void)
 
 static void DoIntro(void)
 {
-    draw_LCD(splash_screen);   /* "BATTLE ARENA" / "START" + fighter art */
-
+    /* splash_screen is drawn once at each entry into STATE_INTRO (at boot,
+       and on restart from the game-over screen) - see main() and
+       DoGameOver() - so we just poll for a key press here, no repeated
+       full-screen redraw. */
     if (GetNewKeyPress() != KEY_NONE)
     {
         ResetMatch();
@@ -653,7 +662,7 @@ static void DoGameOver(void)
 
     if (iWon)
     {
-        draw_LCD(MY_WIN);
+        draw_LCD((unsigned char *)MY_WIN);
         Buzzer_Beep(120, 100, 3);
         Delay_ms(2000);
     }
@@ -687,7 +696,7 @@ static void DoGameOver(void)
         DrvGPIO_ClrBit(LED_PORT, LED_YELLOW_PIN);
         DrvGPIO_ClrBit(LED_PORT, LED_RED_PIN);
         g_state = STATE_INTRO;
-        clear_LCD();
+        draw_LCD((unsigned char *)splash_screen);
     }
 }
 
@@ -699,6 +708,7 @@ int main(void)
     Hardware_Init();
 
     g_state = STATE_INTRO;
+    draw_LCD((unsigned char *)splash_screen);
 
     while (1)
     {
