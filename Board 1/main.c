@@ -31,7 +31,7 @@
 #include "LCD.h"
 #include "Scankey.h"
 #include "Seven_Segment.h"
-#include "sprites.h"
+#include "Sprites.h"
 
 #define I_AM_BOY   1     /* TODO: flip to 0 on the second board */
 
@@ -419,9 +419,7 @@ static void ResetMatch(void)
 
 static void DoIntro(void)
 {
-    print_Line(0, "BATTLE ARENA");
-    print_Line(2, "Press any key");
-    print_Line(3, "to start match");
+    draw_LCD(splash_screen);   /* "BATTLE ARENA" / "START" + fighter art */
 
     if (GetNewKeyPress() != KEY_NONE)
     {
