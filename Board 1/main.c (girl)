@@ -10,17 +10,17 @@
     !! EDIT THIS PER BOARD BEFORE FLASHING !!
     -------------------------------------------------------------------------
     Set I_AM_BOY to 1 on one board and 0 on the other, just below. That's
-    the ONLY difference between the two boards' firmware - it selects which
-    character sprite you play as and which physical keys (of the 6 on the
-    keypad) move/attack with.
+    the ONLY difference between the two boards' firmware - it now ONLY
+    selects which character sprite you play as (boy or girl). Key bindings
+    are identical on both boards (see below), since the physical keypad
+    layout is the same on both.
 
-    Key codes and the boy/girl sprite set are taken from your working
-    2-player local demo (ScanKey() returns 1-6 for the 6 keypad buttons,
-    0/other = idle):
-        keys 1,2,3 = girl: move-left, attack, move-right
-        keys 4,5,6 = boy : move-left, attack, move-right
-    Each board only plays ONE character, so the 3 unused keys from the
-    other character's set are repurposed here for kick/special/block.
+    Keypad is a real 3x3 numeric pad (confirmed on hardware):
+        TL=1  TM=2  TR=3
+        ML=4  MM=5  MR=6
+        BL=7  BM=8  BR=9
+    Controls use the classic numpad-as-dpad layout: 4/6 = left/right,
+    5 = punch, 8 = kick, 2 = special, 7 = block. 1/3/9 are currently unused.
 =============================================================================*/
 
 #include <stdio.h>
@@ -33,7 +33,7 @@
 #include "Seven_Segment.h"
 #include "Sprites.h"
 
-#define I_AM_BOY   1     /* TODO: flip to 0 on the second board */
+#define I_AM_BOY   0     /* This file = BOARD 2 (girl). Do not change. */
 
 /*-----------------------------------------------------------------------
   Board / pin configuration  (TODO: confirm against your LB-002 wiring)
@@ -50,27 +50,21 @@
 #define BUZZER_PIN          3
 
 /*-----------------------------------------------------------------------
-  Keypad mapping - verified against the working reference demo.
-  KEY_NONE = 0 (ScanKey() never matches any of the switch cases 1-6 when
-  idle in that demo, so 0/anything-else is treated as "no key").
+  Keypad mapping - CONFIRMED against real hardware: this is a genuine 3x3
+  numeric keypad (TL=1,TM=2,TR=3,ML=4,MM=5,MR=6,BL=7,BM=8,BR=9), not the
+  6-key split we originally assumed from the old single-board demo. Since
+  the physical layout is identical on both boards, BOTH boards now use
+  this SAME mapping - no more per-board key swapping needed. Uses the
+  classic numpad-as-dpad convention (4/6 = left/right, 5 = center action).
+  KEY_NONE = 0 (no key pressed).
 -----------------------------------------------------------------------*/
 #define KEY_NONE            0
-
-#if I_AM_BOY
-    #define KEY_LEFT        4
-    #define KEY_PUNCH       5
-    #define KEY_RIGHT       6
-    #define KEY_KICK        1
-    #define KEY_SPECIAL     2
-    #define KEY_BLOCK       3
-#else
-    #define KEY_LEFT        1
-    #define KEY_PUNCH       2
-    #define KEY_RIGHT       3
-    #define KEY_KICK        4
-    #define KEY_SPECIAL     5
-    #define KEY_BLOCK       6
-#endif
+#define KEY_LEFT            4
+#define KEY_RIGHT           6
+#define KEY_PUNCH           5
+#define KEY_KICK            8
+#define KEY_SPECIAL         2
+#define KEY_BLOCK           7
 
 /*-----------------------------------------------------------------------
   Character sprite selection
@@ -162,12 +156,21 @@ static void Delay_ms(uint32_t ms)
     DrvSYS_Delay(ms * 1000UL);
 }
 
+/* Direct register-level send, matching the same fix already applied to
+   receiving (DrvUART_Read() was unreliable, so we switched to the raw
+   register macros for RX - doing the same for TX here in case
+   DrvUART_Write() has a similar issue). Waits for the TX FIFO to report
+   empty/ready before writing each byte directly to the data register. */
+static void UART_SendByte(uint8_t b)
+{
+    while (!_DRVUART_WAIT_TX_EMPTY(UART_CH));
+    _DRVUART_SENDBYTE(UART_CH, b);
+}
+
 static void UART_SendPacket(uint8_t cmd, uint8_t data)
 {
-    uint8_t buf[2];
-    buf[0] = cmd;
-    buf[1] = data;
-    DrvUART_Write(UART_CH, buf, 2);
+    UART_SendByte(cmd);
+    UART_SendByte(data);
 }
 
 /* Non-blocking single-byte read. Uses the raw register macro directly
@@ -263,14 +266,102 @@ static void ShowTimer(uint16_t seconds)
     DrvSYS_Delay(1200);
 }
 
-/* Only redraws the single text status row (top of screen) - the sprite
-   area below it (y=16..64) is drawn/erased separately by the sprite
-   helpers below, only when something actually moves/changes, so this
-   does NOT clear_LCD() the whole screen (that would wipe the sprites). */
-static void RefreshStatusLine(void)
+/*=============================================================================
+    HP bars - drawn only when HP actually changes (a hit lands), not on
+    every loop tick, since per-pixel drawing on this LCD is fairly slow
+    over SPI. Two bars meet in the middle: mine grows from the left edge,
+    the enemy's grows from the right edge, both shrinking toward center
+    as HP drops - classic fighting-game health bar layout. A small heart
+    icon sits at the outer end of each bar (drawn once, since it never
+    changes) to mark that the bar represents life/HP.
+=============================================================================*/
+#define HEART_W          7
+#define HEART_H          6
+#define HEART_GAP        2      /* gap between heart icon and bar tray */
+
+#define HP_BAR_Y0        2
+#define HP_BAR_HEIGHT    11
+#define HP_BAR_WIDTH     46     /* max fill width per bar (shrunk to make
+                                    room for the heart icons) */
+#define HP_BAR_MY_X0     (1 + HEART_W + HEART_GAP)            /* bar starts after left heart */
+#define HP_BAR_ENEMY_X1  (LCD_Xmax - 1 - HEART_W - HEART_GAP) /* bar ends before right heart */
+
+#define HEART_MY_X0      1                        /* left heart, screen edge */
+#define HEART_ENEMY_X0   (LCD_Xmax - 1 - HEART_W) /* right heart, screen edge */
+#define HEART_Y0         (HP_BAR_Y0 + (HP_BAR_HEIGHT - HEART_H) / 2)
+
+static const uint8_t HEART_ROWS[HEART_H][HEART_W] =
 {
-    sprintf(g_lcdLine, "P:%3d E:%3d T:%2d", g_myHP, g_enemyHP, g_timeLeft);
-    print_Line(0, g_lcdLine);
+    {0,1,1,0,1,1,0},
+    {1,1,1,1,1,1,1},
+    {1,1,1,1,1,1,1},
+    {0,1,1,1,1,1,0},
+    {0,0,1,1,1,0,0},
+    {0,0,0,1,0,0,0}
+};
+
+static void DrawHeart(int16_t x0, int16_t y0)
+{
+    int16_t r, c;
+    for (r = 0; r < HEART_H; r++)
+        for (c = 0; c < HEART_W; c++)
+            if (HEART_ROWS[r][c])
+                draw_Pixel(x0 + c, y0 + r, FG_COLOR, BG_COLOR);
+}
+
+static void DrawHPBarHearts(void)
+{
+    DrawHeart(HEART_MY_X0, HEART_Y0);
+    DrawHeart(HEART_ENEMY_X0, HEART_Y0);
+}
+
+static void DrawHPBars(void)
+{
+    int16_t myFill    = (int16_t)((g_myHP    * HP_BAR_WIDTH) / START_HP);
+    int16_t enemyFill = (int16_t)((g_enemyHP * HP_BAR_WIDTH) / START_HP);
+    int16_t x, y;
+    int16_t enemyX0 = HP_BAR_ENEMY_X1 - HP_BAR_WIDTH;
+
+    if (myFill < 0) myFill = 0;
+    if (enemyFill < 0) enemyFill = 0;
+
+    /* clear both bar trays first */
+    for (y = HP_BAR_Y0; y < HP_BAR_Y0 + HP_BAR_HEIGHT; y++)
+    {
+        for (x = HP_BAR_MY_X0; x < HP_BAR_MY_X0 + HP_BAR_WIDTH; x++)
+            draw_Pixel(x, y, BG_COLOR, BG_COLOR);
+        for (x = enemyX0; x < HP_BAR_ENEMY_X1; x++)
+            draw_Pixel(x, y, BG_COLOR, BG_COLOR);
+    }
+
+    /* outline (empty tray outline) */
+    for (x = HP_BAR_MY_X0; x < HP_BAR_MY_X0 + HP_BAR_WIDTH; x++)
+    {
+        draw_Pixel(x, HP_BAR_Y0, FG_COLOR, BG_COLOR);
+        draw_Pixel(x, HP_BAR_Y0 + HP_BAR_HEIGHT - 1, FG_COLOR, BG_COLOR);
+    }
+    for (x = enemyX0; x < HP_BAR_ENEMY_X1; x++)
+    {
+        draw_Pixel(x, HP_BAR_Y0, FG_COLOR, BG_COLOR);
+        draw_Pixel(x, HP_BAR_Y0 + HP_BAR_HEIGHT - 1, FG_COLOR, BG_COLOR);
+    }
+    for (y = HP_BAR_Y0; y < HP_BAR_Y0 + HP_BAR_HEIGHT; y++)
+    {
+        draw_Pixel(HP_BAR_MY_X0, y, FG_COLOR, BG_COLOR);
+        draw_Pixel(HP_BAR_MY_X0 + HP_BAR_WIDTH - 1, y, FG_COLOR, BG_COLOR);
+        draw_Pixel(enemyX0, y, FG_COLOR, BG_COLOR);
+        draw_Pixel(HP_BAR_ENEMY_X1 - 1, y, FG_COLOR, BG_COLOR);
+    }
+
+    /* filled portion - mine grows rightward from the left edge, enemy's
+       grows leftward from the right edge, so both shrink toward center */
+    for (y = HP_BAR_Y0 + 1; y < HP_BAR_Y0 + HP_BAR_HEIGHT - 1; y++)
+    {
+        for (x = HP_BAR_MY_X0 + 1; x < HP_BAR_MY_X0 + 1 + myFill; x++)
+            draw_Pixel(x, y, FG_COLOR, BG_COLOR);
+        for (x = HP_BAR_ENEMY_X1 - 1 - enemyFill; x < HP_BAR_ENEMY_X1 - 1; x++)
+            draw_Pixel(x, y, FG_COLOR, BG_COLOR);
+    }
 }
 
 /*=============================================================================
@@ -310,6 +401,24 @@ static uint8_t InAttackRange(void)
     int16_t d = g_myX - g_enemyX;
     if (d < 0) d = -d;
     return (d <= HIT_RANGE);
+}
+
+/* Quick forward lunge toward the enemy and back, played on a successful
+   attack - simulates a punch/kick motion using the existing sprite
+   (no dedicated attack-pose artwork needed). */
+static void PlayAttackLunge(void)
+{
+    int16_t dir    = (g_enemyX >= g_myX) ? 1 : -1;
+    int16_t lungeX = g_myX + dir * 8;
+
+    if (lungeX < SPRITE_MIN_X) lungeX = SPRITE_MIN_X;
+    if (lungeX > SPRITE_MAX_X) lungeX = SPRITE_MAX_X;
+
+    EraseSprite(g_myX, MY_SPRITE);
+    DrawSprite(lungeX, MY_SPRITE);
+    Delay_ms(80);
+    EraseSprite(lungeX, MY_SPRITE);
+    DrawSprite(g_myX, MY_SPRITE);
 }
 
 static void MoveMe(int16_t dx)
@@ -516,7 +625,8 @@ static void DoCountdown(void)
     Delay_ms(600);
 
     clear_LCD();
-    RefreshStatusLine();
+    DrawHPBars();
+    DrawHPBarHearts();
     DrawSprite(g_myX, MY_SPRITE);
     DrawSprite(g_enemyX, ENEMY_SPRITE);
 
@@ -533,6 +643,7 @@ static void ApplyIncomingDamage(uint8_t dmg)
 
     Buzzer_Beep(60, 0, 1);                 /* "hit" beep */
     FlashDefeat(g_myX, MY_SPRITE, MY_DEFEAT);
+    DrawHPBars();
     UART_SendPacket(CMD_HP_UPDATE, (uint8_t)g_myHP);
 }
 
@@ -542,12 +653,26 @@ static void DoBattle_HandleAttackKey(uint8_t key)
     {
         case KEY_PUNCH:
             if (InAttackRange())
+            {
                 UART_SendPacket(CMD_PUNCH, DMG_PUNCH);
+                PlayAttackLunge();
+            }
+            else
+            {
+                Buzzer_Beep(30, 30, 2);   /* quick double-tick: "too far" */
+            }
             break;
 
         case KEY_KICK:
             if (InAttackRange())
+            {
                 UART_SendPacket(CMD_KICK, DMG_KICK);
+                PlayAttackLunge();
+            }
+            else
+            {
+                Buzzer_Beep(30, 30, 2);
+            }
             break;
 
         case KEY_SPECIAL:
@@ -556,6 +681,16 @@ static void DoBattle_HandleAttackKey(uint8_t key)
                 UART_SendPacket(CMD_SPECIAL, DMG_SPECIAL);
                 Buzzer_Beep(400, 0, 1);
                 g_specialCooldown = SPECIAL_COOLDOWN_S;
+                PlayAttackLunge();
+            }
+            else if (InAttackRange())
+            {
+                /* in range but still on cooldown - different feedback */
+                Buzzer_Beep(30, 30, 3);
+            }
+            else
+            {
+                Buzzer_Beep(30, 30, 2);
             }
             break;
 
@@ -588,6 +723,11 @@ static void DoBattle_HandlePacket(uint8_t cmd, uint8_t data)
             break;
 
         case CMD_POS_UPDATE:
+            /* --- TEMP DEBUG: short distinct beep every time a position
+               packet is actually received, so we can confirm whether these
+               are arriving at all. Remove once position sync is confirmed
+               working. ------------------------------------------------- */
+            Buzzer_Beep(15, 0, 1);
             UpdateEnemyPos(data);
             break;
 
@@ -596,6 +736,7 @@ static void DoBattle_HandlePacket(uint8_t cmd, uint8_t data)
                 FlashDefeat(g_enemyX, ENEMY_SPRITE, ENEMY_DEFEAT);
             g_prevEnemyHP = data;
             g_enemyHP     = data;
+            DrawHPBars();
             break;
 
         case CMD_GAME_OVER:
@@ -630,10 +771,12 @@ static void DoBattle(void)
             key == KEY_SPECIAL || key == KEY_BLOCK)
             DoBattle_HandleAttackKey(key);
 
-        if (UART_TryReceivePacket(&cmd, &data))
+        /* drain ALL queued packets this chunk, not just one - movement
+           sends packets rapidly while a direction key is held, so a
+           single-packet-per-chunk read can let a backlog build up */
+        while (UART_TryReceivePacket(&cmd, &data))
             DoBattle_HandlePacket(cmd, data);
 
-        RefreshStatusLine();
         LED_UpdateForHP(g_myHP);
 
         if (g_myHP <= 0 || g_enemyHP <= 0)
