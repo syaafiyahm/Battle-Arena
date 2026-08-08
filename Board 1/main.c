@@ -252,6 +252,8 @@ static void ShowTimer(uint16_t seconds)
     uint8_t tens = (uint8_t)(seconds / 10);
     uint8_t ones = (uint8_t)(seconds % 10);
 
+    /* Digit slots (2,3) confirmed working - this uses the other pair,
+       (0,1), instead. */
     close_seven_segment();
     show_seven_segment(1, tens);
     DrvSYS_Delay(1200);
@@ -637,8 +639,16 @@ static void DoBattle(void)
         if (g_myHP <= 0 || g_enemyHP <= 0)
             break;
 
-        ShowTimer(g_timeLeft);   /* refresh every chunk (~10x/sec) so it stays lit */
-        Delay_ms(100);           /* 10 x 100ms = ~1s per outer tick */
+        /* Keep both 7-seg digits refreshed continuously through this whole
+           ~100ms gap (not just once) so tens/ones get roughly equal
+           on-time - otherwise whichever digit show_seven_segment() sets
+           LAST stays lit almost the whole 100ms while the other only
+           gets a ~1.2ms flash per chunk, far too dim to see. */
+        {
+            uint8_t r;
+            for (r = 0; r < 40; r++)
+                ShowTimer(g_timeLeft);   /* ~2.4ms/call x 40 = ~1 chunk (~100ms) */
+        }
     }
 
     /* --- 1 Hz bookkeeping --- */
