@@ -491,21 +491,27 @@ static void DoWaitOpponent(void)
 
 static void DoCountdown(void)
 {
-    int8_t i;
     close_seven_segment();   /* blank leftover digit from previous match */
 
-    for (i = 3; i >= 1; i--)
-    {
-        clear_LCD();
-        sprintf(g_lcdLine, "%d...", i);
-        print_Line(3, g_lcdLine);
-        Buzzer_Beep(100, 0, 1);
-        Delay_ms(700);
-    }
-    clear_LCD();
-    print_Line(3, "FIGHT!!");
+    draw_LCD((unsigned char *)starting_word);
+    Buzzer_Beep(150, 0, 1);
+    Delay_ms(900);
+
+    draw_LCD((unsigned char *)digit_3);
+    Buzzer_Beep(100, 0, 1);
+    Delay_ms(700);
+
+    draw_LCD((unsigned char *)digit_2);
+    Buzzer_Beep(100, 0, 1);
+    Delay_ms(700);
+
+    draw_LCD((unsigned char *)digit_1);
+    Buzzer_Beep(100, 0, 1);
+    Delay_ms(700);
+
+    draw_LCD((unsigned char *)start_word);
     Buzzer_Beep(300, 0, 1);
-    Delay_ms(500);
+    Delay_ms(600);
 
     clear_LCD();
     RefreshStatusLine();
