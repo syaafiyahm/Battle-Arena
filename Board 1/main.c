@@ -7,19 +7,20 @@
     Connect the two boards' UART0 TX/RX/GND together (cross TX<->RX).
 
     -------------------------------------------------------------------------
-    !! THINGS YOU MUST VERIFY / EDIT FOR YOUR OWN BOARD (search "TODO") !!
+    !! EDIT THIS PER BOARD BEFORE FLASHING !!
     -------------------------------------------------------------------------
-    1. LED_PORT / LED_xxx_PIN and BUZZER_PORT / BUZZER_PIN - I don't have your
-       schematic, so these are placeholders. Change them to match your LB-002
-       wiring.
-    2. KEY_NONE - the "no key pressed" return value of ScanKey(). I don't have
-       ScanKey.c, so this is my best-guess default. If keys don't register or
-       register when nothing is pressed, open your working keypad demo
-       (haha2) and check what ScanKey() returns when idle, then fix KEY_NONE
-       and the KEY_1..KEY_4 defines below to match your matrix layout.
-    3. UART wiring - this assumes UART_PORT0 pins are muxed via
-       DrvGPIO_InitFunction(E_FUNC_UART0_RX_TX). If your board uses UART1/2,
-       change UART_CH and the InitFunction call.
+    Set I_AM_BOY to 1 on one board and 0 on the other, just below. That's
+    the ONLY difference between the two boards' firmware - it selects which
+    character sprite you play as and which physical keys (of the 6 on the
+    keypad) move/attack with.
+
+    Key codes and the boy/girl sprite set are taken from your working
+    2-player local demo (ScanKey() returns 1-6 for the 6 keypad buttons,
+    0/other = idle):
+        keys 1,2,3 = girl: move-left, attack, move-right
+        keys 4,5,6 = boy : move-left, attack, move-right
+    Each board only plays ONE character, so the 3 unused keys from the
+    other character's set are repurposed here for kick/special/block.
 =============================================================================*/
 
 #include <stdio.h>
@@ -30,6 +31,9 @@
 #include "LCD.h"
 #include "Scankey.h"
 #include "Seven_Segment.h"
+#include "sprites.h"
+
+#define I_AM_BOY   1     /* TODO: flip to 0 on the second board */
 
 /*-----------------------------------------------------------------------
   Board / pin configuration  (TODO: confirm against your LB-002 wiring)
@@ -46,13 +50,51 @@
 #define BUZZER_PIN          3
 
 /*-----------------------------------------------------------------------
-  Keypad mapping (TODO: confirm against ScanKey.c / haha2 demo)
+  Keypad mapping - verified against the working reference demo.
+  KEY_NONE = 0 (ScanKey() never matches any of the switch cases 1-6 when
+  idle in that demo, so 0/anything-else is treated as "no key").
 -----------------------------------------------------------------------*/
-#define KEY_NONE            0xFF
-#define KEY_1               1          /* Punch          -5 HP        */
-#define KEY_2               2          /* Kick           -10 HP       */
-#define KEY_3               3          /* Special Attack -20 HP       */
-#define KEY_4               4          /* Block          -50% dmg     */
+#define KEY_NONE            0
+
+#if I_AM_BOY
+    #define KEY_LEFT        4
+    #define KEY_PUNCH       5
+    #define KEY_RIGHT       6
+    #define KEY_KICK        1
+    #define KEY_SPECIAL     2
+    #define KEY_BLOCK       3
+#else
+    #define KEY_LEFT        1
+    #define KEY_PUNCH       2
+    #define KEY_RIGHT       3
+    #define KEY_KICK        4
+    #define KEY_SPECIAL     5
+    #define KEY_BLOCK       6
+#endif
+
+/*-----------------------------------------------------------------------
+  Character sprite selection
+-----------------------------------------------------------------------*/
+#if I_AM_BOY
+    #define MY_SPRITE       boy
+    #define MY_DEFEAT       boydefeat
+    #define MY_WIN          boywin
+    #define ENEMY_SPRITE    girl
+    #define ENEMY_DEFEAT    girldefeat
+#else
+    #define MY_SPRITE       girl
+    #define MY_DEFEAT       girldefeat
+    #define MY_WIN          girlwin
+    #define ENEMY_SPRITE    boy
+    #define ENEMY_DEFEAT    boydefeat
+#endif
+
+#define SPRITE_Y            16   /* sprites are 32x48, screen is 128x64 -
+                                     y=16..64 is exactly the sprite band */
+#define SPRITE_MIN_X        1
+#define SPRITE_MAX_X        95
+#define MOVE_STEP           3
+#define HIT_RANGE           30   /* max pixel gap for an attack to land */
 
 /*-----------------------------------------------------------------------
   Game constants
@@ -79,6 +121,9 @@
 #define CMD_HP_UPDATE       0x06
 #define CMD_GAME_OVER       0x07
 #define CMD_RESTART         0x08
+#define CMD_POS_UPDATE      0x09   /* [CMD_POS_UPDATE, xPosition] - extra
+                                       command beyond the original 8, needed
+                                       to sync on-screen character position */
 
 /*-----------------------------------------------------------------------
   Game state machine
@@ -94,15 +139,15 @@ typedef enum
 
 static E_GAME_STATE g_state;
 
-static int16_t  g_myHP,    g_enemyHP;
+static int16_t  g_myHP,    g_enemyHP, g_prevEnemyHP;
+static int16_t  g_myX,     g_enemyX;
 static uint16_t g_timeLeft;              /* seconds remaining          */
 static uint8_t  g_specialCooldown;       /* seconds left before usable */
 static uint8_t  g_blockCooldown;
 static uint8_t  g_blockActiveTicks;      /* seconds the shield still holds */
 static uint8_t  g_lastKey = KEY_NONE;    /* for simple debounce (edge detect) */
 
-static char     g_lcdLine[17];
-static char     g_statusMsg[17] = "";
+static char     g_lcdLine[24];
 
 /*=============================================================================
     Low level helpers
@@ -125,11 +170,9 @@ static void UART_SendPacket(uint8_t cmd, uint8_t data)
     DrvUART_Write(UART_CH, buf, 2);
 }
 
-/* Non-blocking single-byte read (used for the un-framed handshake, where
-   we just need to spot a single marker byte anywhere in the stream).
-   Uses the raw register macro directly instead of DrvUART_Read(), since
-   DrvUART_Read() was observed reporting failure even when
-   _DRVUART_RECEIVEAVAILABLE() shows bytes waiting in the FIFO. */
+/* Non-blocking single-byte read. Uses the raw register macro directly
+   instead of DrvUART_Read(), since DrvUART_Read() was observed reporting
+   failure even when _DRVUART_RECEIVEAVAILABLE() shows bytes waiting. */
 static int32_t UART_TryReceiveByte(uint8_t *outByte)
 {
     if (_DRVUART_RECEIVEAVAILABLE(UART_CH) < 1)
@@ -140,9 +183,7 @@ static int32_t UART_TryReceiveByte(uint8_t *outByte)
 }
 
 /* Non-blocking receive: returns 1 and fills cmd/data if a full 2 byte
-   packet is available, otherwise returns 0 immediately. Built on top of
-   UART_TryReceiveByte() (the raw register read) rather than DrvUART_Read()
-   for the same reliability reason. */
+   packet is available, otherwise returns 0 immediately. */
 static int32_t UART_TryReceivePacket(uint8_t *cmd, uint8_t *data)
 {
     if (_DRVUART_RECEIVEAVAILABLE(UART_CH) < 2)
@@ -173,7 +214,6 @@ static void LED_UpdateForHP(int16_t hp)
 {
     if (hp <= 0)
     {
-        /* all LEDs flash - handled by caller loop, just force all on here */
         DrvGPIO_SetBit(LED_PORT, LED_GREEN_PIN);
         DrvGPIO_SetBit(LED_PORT, LED_YELLOW_PIN);
         DrvGPIO_SetBit(LED_PORT, LED_RED_PIN);
@@ -196,7 +236,6 @@ static void LED_UpdateForHP(int16_t hp)
     {
         DrvGPIO_ClrBit(LED_PORT, LED_GREEN_PIN);
         DrvGPIO_ClrBit(LED_PORT, LED_YELLOW_PIN);
-        /* simple blink using system tick parity */
         if ((g_timeLeft & 1) == 0)
             DrvGPIO_SetBit(LED_PORT, LED_RED_PIN);
         else
@@ -206,9 +245,8 @@ static void LED_UpdateForHP(int16_t hp)
 
 /* Matches the working pattern from Smpl_7seg's DisplayCounter(): each
    digit is only lit while its enable pin is held, so we must close then
-   re-show each digit in turn. This function must be called REPEATEDLY
-   (many times a second) for the display to stay visibly lit via
-   persistence of vision - a single call per second is not enough. */
+   re-show each digit in turn. Must be called REPEATEDLY (many times a
+   second) to stay visibly lit via persistence of vision. */
 static void ShowTimer(uint16_t seconds)
 {
     uint8_t tens = (uint8_t)(seconds / 10);
@@ -223,17 +261,65 @@ static void ShowTimer(uint16_t seconds)
     DrvSYS_Delay(1200);
 }
 
-static void RefreshLCD(char *myStatus)
+/* Only redraws the single text status row (top of screen) - the sprite
+   area below it (y=16..64) is drawn/erased separately by the sprite
+   helpers below, only when something actually moves/changes, so this
+   does NOT clear_LCD() the whole screen (that would wipe the sprites). */
+static void RefreshStatusLine(void)
 {
-    clear_LCD();
-
-    sprintf(g_lcdLine, "P:%3d E:%3d", g_myHP, g_enemyHP);
+    sprintf(g_lcdLine, "P:%3d E:%3d T:%2d", g_myHP, g_enemyHP, g_timeLeft);
     print_Line(0, g_lcdLine);
+}
 
-    sprintf(g_lcdLine, "Time: %2d", g_timeLeft);
-    print_Line(1, g_lcdLine);
+/*=============================================================================
+    Sprite helpers
+=============================================================================*/
+static void DrawSprite(int16_t x, unsigned char *bmp)
+{
+    draw_Bmp32x48(x, SPRITE_Y, FG_COLOR, BG_COLOR, bmp);
+}
 
-    print_Line(3, myStatus);
+static void EraseSprite(int16_t x, unsigned char *bmp)
+{
+    draw_Bmp32x48(x, SPRITE_Y, BG_COLOR, BG_COLOR, bmp);
+}
+
+/* Brief "got hit" animation: swap to the defeat bitmap for a moment, then
+   back to normal. Used both when I get hit and (visually) when I land a
+   confirmed hit on the enemy. */
+static void FlashDefeat(int16_t x, unsigned char *normalBmp, unsigned char *defeatBmp)
+{
+    EraseSprite(x, normalBmp);
+    DrawSprite(x, defeatBmp);
+    Delay_ms(150);
+    EraseSprite(x, defeatBmp);
+    DrawSprite(x, normalBmp);
+}
+
+static uint8_t InAttackRange(void)
+{
+    int16_t d = g_myX - g_enemyX;
+    if (d < 0) d = -d;
+    return (d <= HIT_RANGE);
+}
+
+static void MoveMe(int16_t dx)
+{
+    EraseSprite(g_myX, MY_SPRITE);
+
+    g_myX += dx;
+    if (g_myX < SPRITE_MIN_X) g_myX = SPRITE_MIN_X;
+    if (g_myX > SPRITE_MAX_X) g_myX = SPRITE_MAX_X;
+
+    DrawSprite(g_myX, MY_SPRITE);
+    UART_SendPacket(CMD_POS_UPDATE, (uint8_t)g_myX);
+}
+
+static void UpdateEnemyPos(uint8_t x)
+{
+    EraseSprite(g_enemyX, ENEMY_SPRITE);
+    g_enemyX = x;
+    DrawSprite(g_enemyX, ENEMY_SPRITE);
 }
 
 /*=============================================================================
@@ -270,9 +356,7 @@ static void Hardware_Init(void)
     DrvGPIO_Open(BUZZER_PORT, BUZZER_PIN, E_IO_OUTPUT);
     DrvGPIO_ClrBit(BUZZER_PORT, BUZZER_PIN);
 
-    /* --- 7-Segment (matches Init_RotateSeg() from Smpl_7seg, plus
-           GPC4/5 explicitly since we also drive digit indices 0 and 1
-           which that demo left implicit) --- */
+    /* --- 7-Segment --- */
     DrvGPIO_Open(E_GPC, 4, E_IO_OUTPUT);
     DrvGPIO_Open(E_GPC, 5, E_IO_OUTPUT);
     DrvGPIO_Open(E_GPC, 6, E_IO_OUTPUT);
@@ -293,19 +377,23 @@ static void Hardware_Init(void)
 }
 
 /*=============================================================================
-    Keypad helper - returns a NEWLY pressed key once (edge-triggered),
-    or KEY_NONE if nothing new was pressed since the last call.
+    Keypad helper - debounces a raw ScanKey() value into a single edge-
+    triggered press (fires once per press, not once per poll while held).
 =============================================================================*/
-static uint8_t GetNewKeyPress(void)
+static uint8_t DebounceKey(uint8_t rawKey)
 {
-    uint8_t key = ScanKey();
     uint8_t pressed = KEY_NONE;
 
-    if (key != KEY_NONE && key != g_lastKey)
-        pressed = key;
+    if (rawKey != KEY_NONE && rawKey != g_lastKey)
+        pressed = rawKey;
 
-    g_lastKey = key;
+    g_lastKey = rawKey;
     return pressed;
+}
+
+static uint8_t GetNewKeyPress(void)
+{
+    return DebounceKey(ScanKey());
 }
 
 /*=============================================================================
@@ -315,16 +403,23 @@ static void ResetMatch(void)
 {
     g_myHP            = START_HP;
     g_enemyHP         = START_HP;
+    g_prevEnemyHP     = START_HP;
     g_timeLeft        = MATCH_SECONDS;
     g_specialCooldown = 0;
     g_blockCooldown   = 0;
     g_blockActiveTicks= 0;
     g_lastKey         = KEY_NONE;
+
+#if I_AM_BOY
+    g_myX = 10;  g_enemyX = 85;
+#else
+    g_myX = 85;  g_enemyX = 10;
+#endif
 }
 
 static void DoIntro(void)
 {
-    print_Line(0, "== BATTLE ARENA ==");
+    print_Line(0, "BATTLE ARENA");
     print_Line(2, "Press any key");
     print_Line(3, "to start match");
 
@@ -391,6 +486,7 @@ static void DoCountdown(void)
 {
     int8_t i;
     close_seven_segment();   /* blank leftover digit from previous match */
+
     for (i = 3; i >= 1; i--)
     {
         clear_LCD();
@@ -405,6 +501,10 @@ static void DoCountdown(void)
     Delay_ms(500);
 
     clear_LCD();
+    RefreshStatusLine();
+    DrawSprite(g_myX, MY_SPRITE);
+    DrawSprite(g_enemyX, ENEMY_SPRITE);
+
     g_state = STATE_BATTLE;
 }
 
@@ -417,48 +517,39 @@ static void ApplyIncomingDamage(uint8_t dmg)
     if (g_myHP < 0) g_myHP = 0;
 
     Buzzer_Beep(60, 0, 1);                 /* "hit" beep */
+    FlashDefeat(g_myX, MY_SPRITE, MY_DEFEAT);
     UART_SendPacket(CMD_HP_UPDATE, (uint8_t)g_myHP);
 }
 
-static void DoBattle_HandleKey(uint8_t key)
+static void DoBattle_HandleAttackKey(uint8_t key)
 {
     switch (key)
     {
-        case KEY_1: /* Punch */
-            UART_SendPacket(CMD_PUNCH, DMG_PUNCH);
-            sprintf(g_statusMsg, "You: PUNCH!");
+        case KEY_PUNCH:
+            if (InAttackRange())
+                UART_SendPacket(CMD_PUNCH, DMG_PUNCH);
             break;
 
-        case KEY_2: /* Kick */
-            UART_SendPacket(CMD_KICK, DMG_KICK);
-            sprintf(g_statusMsg, "You: KICK!");
+        case KEY_KICK:
+            if (InAttackRange())
+                UART_SendPacket(CMD_KICK, DMG_KICK);
             break;
 
-        case KEY_3: /* Special Attack (cooldown) */
-            if (g_specialCooldown == 0)
+        case KEY_SPECIAL:
+            if (g_specialCooldown == 0 && InAttackRange())
             {
                 UART_SendPacket(CMD_SPECIAL, DMG_SPECIAL);
                 Buzzer_Beep(400, 0, 1);
                 g_specialCooldown = SPECIAL_COOLDOWN_S;
-                sprintf(g_statusMsg, "You: SPECIAL!");
-            }
-            else
-            {
-                sprintf(g_statusMsg, "Special on CD");
             }
             break;
 
-        case KEY_4: /* Block (cooldown) */
+        case KEY_BLOCK:
             if (g_blockCooldown == 0)
             {
                 g_blockActiveTicks = BLOCK_ACTIVE_S;
                 g_blockCooldown    = BLOCK_COOLDOWN_S;
                 UART_SendPacket(CMD_BLOCK, 0);
-                sprintf(g_statusMsg, "You: BLOCK!");
-            }
-            else
-            {
-                sprintf(g_statusMsg, "Block on CD");
             }
             break;
 
@@ -475,15 +566,21 @@ static void DoBattle_HandlePacket(uint8_t cmd, uint8_t data)
         case CMD_KICK:
         case CMD_SPECIAL:
             ApplyIncomingDamage(data);
-            sprintf(g_statusMsg, "OUCH!!");
             break;
 
         case CMD_BLOCK:
             /* purely informational - opponent is shielding, nothing to do */
             break;
 
+        case CMD_POS_UPDATE:
+            UpdateEnemyPos(data);
+            break;
+
         case CMD_HP_UPDATE:
-            g_enemyHP = data;
+            if (data < g_prevEnemyHP)
+                FlashDefeat(g_enemyX, ENEMY_SPRITE, ENEMY_DEFEAT);
+            g_prevEnemyHP = data;
+            g_enemyHP     = data;
             break;
 
         case CMD_GAME_OVER:
@@ -498,30 +595,37 @@ static void DoBattle_HandlePacket(uint8_t cmd, uint8_t data)
 
 static void DoBattle(void)
 {
-    uint8_t key, cmd, data;
+    uint8_t rawKey, key, cmd, data;
     uint16_t chunk;
-
-    g_statusMsg[0] = '\0';   /* clear last status at the start of each second */
 
     /* --- one "second" of battle, sliced into short chunks so we keep
            polling keypad + UART instead of freezing for a whole second --- */
     for (chunk = 0; chunk < 10; chunk++)
     {
-        key = GetNewKeyPress();
-        if (key != KEY_NONE)
-            DoBattle_HandleKey(key);
+        rawKey = ScanKey();
+
+        /* continuous movement while a direction key is held down */
+        if (rawKey == KEY_LEFT)  MoveMe(-MOVE_STEP);
+        if (rawKey == KEY_RIGHT) MoveMe(MOVE_STEP);
+
+        /* edge-triggered for attacks so one press = one hit, not a
+           machine-gun of hits for as long as the key is held */
+        key = DebounceKey(rawKey);
+        if (key == KEY_PUNCH || key == KEY_KICK ||
+            key == KEY_SPECIAL || key == KEY_BLOCK)
+            DoBattle_HandleAttackKey(key);
 
         if (UART_TryReceivePacket(&cmd, &data))
             DoBattle_HandlePacket(cmd, data);
 
-        RefreshLCD(g_statusMsg);
+        RefreshStatusLine();
         LED_UpdateForHP(g_myHP);
 
         if (g_myHP <= 0 || g_enemyHP <= 0)
             break;
 
         ShowTimer(g_timeLeft);   /* refresh every chunk (~10x/sec) so it stays lit */
-        Delay_ms(100);   /* 10 x 100ms = ~1s per outer tick */
+        Delay_ms(100);           /* 10 x 100ms = ~1s per outer tick */
     }
 
     /* --- 1 Hz bookkeeping --- */
@@ -539,26 +643,29 @@ static void DoBattle(void)
 
 static void DoGameOver(void)
 {
+    uint8_t iWon = 0, iLost = 0;
+
     close_seven_segment();   /* leave the display clean, no half-lit digit */
+
+    if (g_myHP <= 0 && g_enemyHP > 0)          iLost = 1;
+    else if (g_enemyHP <= 0 && g_myHP > 0)     iWon  = 1;
+    else if (g_myHP > g_enemyHP)               iWon  = 1;
+    else if (g_myHP < g_enemyHP)               iLost = 1;
+    /* else: draw - neither flag set */
+
+    if (iWon)
+    {
+        draw_LCD(MY_WIN);
+        Buzzer_Beep(120, 100, 3);
+        Delay_ms(2000);
+    }
+
     clear_LCD();
     print_Line(0, "GAME OVER");
 
-    if (g_myHP <= 0 && g_enemyHP > 0)
-    {
-        print_Line(1, "YOU LOSE");
-        Buzzer_Beep(250, 150, 3);
-    }
-    else if (g_enemyHP <= 0 && g_myHP > 0)
-    {
+    if (iWon)
         print_Line(1, "YOU WIN!");
-        Buzzer_Beep(120, 100, 3);
-    }
-    else if (g_myHP > g_enemyHP)
-    {
-        print_Line(1, "YOU WIN!");
-        Buzzer_Beep(120, 100, 3);
-    }
-    else if (g_myHP < g_enemyHP)
+    else if (iLost)
     {
         print_Line(1, "YOU LOSE");
         Buzzer_Beep(250, 150, 3);
